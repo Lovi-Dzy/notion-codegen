@@ -1,0 +1,25 @@
+# notion-codegen 项目级配置文件
+# 命令行参数 > 环境变量 > 此文件 > 默认值
+
+[notion]
+# 目标 Notion 页面 ID（32 位或带连字符的 UUID 均可）
+page_id = ""
+
+# 本地输出根目录（支持相对路径和 Windows 绝对路径）
+# 相对路径以运行命令时的当前目录为基准
+# 也可被页面内的 Config Callout 的 output_dir 字段覆盖
+output_dir = "."
+
+[llm]
+# 可选：openai / siliconflow / deepseek / moonshot / claude 等
+provider = "siliconflow"
+# 留空则使用该 provider 的默认模型
+model = ""
+
+[sync]
+# 页面在 Notion 中被删除后，是否自动删除本地对应文件
+# false = 每次提示确认；true = 直接删除（谨慎开启）
+auto_delete = false
+
+# 状态数据库文件路径（记录上次同步的 last_edited_time，用于增量同步）
+state_file = ".codegen_state.db"

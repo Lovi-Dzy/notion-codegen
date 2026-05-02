@@ -1,0 +1,23 @@
+# 虚拟环境
+.venv/
+
+# 敏感配置
+.env
+
+# 状态数据库
+*.db
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# JetBrains IDE
+.idea/
+*.iml
+
+# 构建产物
+dist/
+build/
+*.egg-info/

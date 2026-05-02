@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notion-codegen"
+version = "0.1.0"
+description = "Notion 页面 → 本地项目文件同步工具"
+requires-python = ">=3.11"
+dependencies = [
+    "notion-client>=2.2.1",
+    "litellm>=1.40.0",
+    "openai>=1.0.0",
+    "anthropic",
+    "python-dotenv>=1.0.1",
+    "click>=8.1.7",
+    "rich>=13.7.0",
+    "diff-match-patch>=20230430",
+    "toml>=0.10.2",
+]
+
+[project.scripts]
+notion-codegen = "notion_codegen.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["notion_codegen*"]
