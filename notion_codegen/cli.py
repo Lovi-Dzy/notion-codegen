@@ -29,11 +29,13 @@ from rich.panel import Panel
 
 from .config import load_config
 from .executor import Executor
+from .log import get_logger, setup_logging
 from .notion_reader import NotionReader
 from .parser import PageParser
 from .state import StateDB
 
 console = Console()
+logger = get_logger("cli")
 
 # ── 工具函数 ──────────────────────────────────────────────────
 
@@ -79,9 +81,14 @@ def _get_token() -> str:
 # ── CLI 定义 ──────────────────────────────────────────────────
 
 @click.group()
-def cli() -> None:
+@click.option("--verbose", "-v", is_flag=True, default=False, help="输出详细日志（DEBUG 级别）。")
+@click.pass_context
+def cli(ctx: click.Context, verbose: bool) -> None:
     """notion-codegen：将 Notion 页面同步为本地代码文件。"""
     load_dotenv()
+    setup_logging(verbose=verbose)
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
 
 
 @cli.command()
@@ -109,12 +116,21 @@ def cli() -> None:
     default=False,
     help="遇到第一个错误立即停止。",
 )
+@click.option(
+    "--backup", "-b",
+    is_flag=True,
+    default=False,
+    help="覆盖文件前先创建 .bak 备份。",
+)
+@click.pass_context
 def sync(
+    ctx: click.Context,
     page: str,
     output: str | None,
     dry_run: bool,
     force: bool,
     fail_fast: bool,
+    backup: bool,
 ) -> None:
     """
     从 Notion 页面同步代码到本地。
@@ -147,29 +163,58 @@ def sync(
         )
     )
 
-    # ── 2. 读取 Notion 页面 ───────────────────────────────
-    console.print("\n[bold cyan]► 读取 Notion 页面...[/bold cyan]")
+    # ── 2. 快速增量检查（只拉元数据，不拉内容）──────────────
     reader = NotionReader(token=token)
 
-    try:
-        root_page = reader.read_page(page_id)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]读取页面失败：{exc}[/red]")
-        sys.exit(1)
-
-    # ── 3. 增量检查 ───────────────────────────────────────
     with StateDB(db_path) as db:
-        # 收集所有需要解析的页面（含子页面）
-        all_pages = _collect_all_pages(root_page)
-        pages_to_parse = []
+        if not force:
+            console.print("\n[bold cyan]► 检查页面变更...[/bold cyan]")
+            try:
+                edited_map = reader.get_last_edited_map(page_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("获取页面元数据失败: %s", exc, exc_info=True)
+                console.print(f"[red]获取页面元数据失败：{exc}[/red]")
+                sys.exit(1)
 
-        for p in all_pages:
-            if force or db.needs_sync(p.page_id, p.last_edited_time):
-                pages_to_parse.append(p)
-            else:
+            changed_ids = {
+                pid for pid, ts in edited_map.items()
+                if db.needs_sync(pid, ts)
+            }
+
+            if not changed_ids:
                 console.print(
-                    f"[dim]⏭  跳过未变更页面：{p.title or p.page_id}[/dim]"
+                    "\n[green]✅ 所有页面均未变更，无需同步。[/green]"
                 )
+                return
+            console.print(
+                f"   {len(changed_ids)}/{len(edited_map)} 个页面有变更"
+            )
+        else:
+            changed_ids = None  # force 模式，全部同步
+
+        # ── 3. 只读取有变更的页面内容 ─────────────────────
+        console.print("[bold cyan]► 读取页面内容...[/bold cyan]")
+        try:
+            if changed_ids is None:
+                # force 模式：全量读取
+                root_page = reader.read_page(page_id)
+            else:
+                # 增量模式：只读取根页面（子页面在解析阶段按需读取）
+                root_page = reader.read_page(page_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("读取页面失败: %s", exc, exc_info=True)
+            console.print(f"[red]读取页面失败：{exc}[/red]")
+            sys.exit(1)
+
+        # 过滤出需要解析的页面
+        all_pages = _collect_all_pages(root_page)
+        if changed_ids is not None:
+            pages_to_parse = [p for p in all_pages if p.page_id in changed_ids]
+            skipped = len(all_pages) - len(pages_to_parse)
+            if skipped:
+                console.print(f"[dim]⏭  跳过 {skipped} 个未变更页面[/dim]")
+        else:
+            pages_to_parse = all_pages
 
         if not pages_to_parse:
             console.print(
@@ -203,11 +248,16 @@ def sync(
 
         console.print(f"   共解析到 [bold]{len(all_ops)}[/bold] 个文件操作")
 
-        # ── 5. 执行 ──────────────────────────────────────
+        # ── 5. 执行（带文件级状态追踪）──────────────────
         console.print(
             f"\n[bold cyan]► {'预览（Dry-run）' if dry_run else '执行文件操作'}...[/bold cyan]"
         )
-        executor = Executor(dry_run=dry_run, fail_fast=fail_fast)
+        executor = Executor(
+            dry_run=dry_run,
+            fail_fast=fail_fast,
+            backup=backup,
+            state_db=db if not dry_run else None,
+        )
         summary  = executor.execute(all_ops)
         summary.print_summary()
 
@@ -235,7 +285,6 @@ def sync(
 @click.argument("page", metavar="PAGE_ID_OR_URL")
 def status(page: str) -> None:
     """查看某 Notion 页面的上次同步状态。"""
-    load_dotenv()
     page_id = _extract_page_id(page)
     cfg     = load_config()
     db_path = Path(cfg.state_file) if cfg.state_file else Path(".codegen_state.db")
@@ -257,7 +306,6 @@ def status(page: str) -> None:
 @click.confirmation_option(prompt="确认清空所有同步状态？（下次运行将全量同步）")
 def reset() -> None:
     """清空所有同步状态（下次将全量同步）。"""
-    load_dotenv()
     cfg     = load_config()
     db_path = Path(cfg.state_file) if cfg.state_file else Path(".codegen_state.db")
 

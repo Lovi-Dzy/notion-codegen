@@ -31,9 +31,11 @@ from typing import Optional
 
 from rich.console import Console
 
+from .log import get_logger
 from .notion_reader import NotionPage
 
 console = Console()
+logger = get_logger("parser")
 
 
 # ── 数据结构 ─────────────────────────────────────────────────
@@ -193,6 +195,7 @@ class PageParser:
 
         op_type = _OP_MAP.get(raw_op)
         if op_type is None:
+            logger.debug("未知操作类型 '%s'，忽略：%r", raw_op, text)
             console.print(
                 f"[yellow]⚠  未知操作类型 '{raw_op}'，忽略：{text!r}[/yellow]"
             )

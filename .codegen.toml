@@ -11,13 +11,14 @@ page_id = ""
 output_dir = "."
 
 [llm]
+# LLM 配置（CLI 后续 AI 功能预留，当前版本未使用）
 # 可选：openai / siliconflow / deepseek / moonshot / claude 等
 provider = "siliconflow"
 # 留空则使用该 provider 的默认模型
 model = ""
 
 [sync]
-# 页面在 Notion 中被删除后，是否自动删除本地对应文件
+# 页面在 Notion 中被删除后，是否自动删除本地文件
 # false = 每次提示确认；true = 直接删除（谨慎开启）
 auto_delete = false
 

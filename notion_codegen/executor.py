@@ -5,6 +5,7 @@
 职责：
     接收 FileOperation 列表，按顺序在本地文件系统执行每一项操作。
     提供 dry_run 模式（只打印，不写磁盘）方便调试。
+    支持文件级内容 hash 去重（跳过内容未变的操作）和 .bak 备份。
 
 执行语义：
     create          若文件已存在 → 跳过（幂等）；否则写入
@@ -18,6 +19,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -26,17 +29,25 @@ from typing import Optional
 from rich.console import Console
 from rich.table import Table
 
+from .log import get_logger
 from .parser import FileOperation, OpType
 from .patcher import PatchError, apply_patch
+from .state import StateDB
 
 console = Console()
+logger = get_logger("executor")
+
+
+def _content_hash(text: str) -> str:
+    """计算内容的 sha256 hex digest。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ── 结果数据结构 ──────────────────────────────────────────────
 
 class ResultStatus(Enum):
     OK      = "ok"
-    SKIPPED = "skipped"   # create 时文件已存在；delete 时文件不存在
+    SKIPPED = "skipped"   # create 时文件已存在；delete 时文件不存在；内容未变
     FAILED  = "failed"
 
 
@@ -60,6 +71,11 @@ class ExecutionSummary:
     def failed_count(self)  -> int: return sum(1 for r in self.results if r.status == ResultStatus.FAILED)
     @property
     def has_failures(self)  -> bool: return self.failed_count > 0
+
+    @property
+    def inconsistent_files(self) -> list[Path]:
+        """返回执行失败的文件路径列表（磁盘状态可能不一致）。"""
+        return [r.operation.file_path for r in self.results if r.status == ResultStatus.FAILED]
 
     def print_summary(self) -> None:
         """用 rich 打印执行结果汇总表格。"""
@@ -91,6 +107,19 @@ class ExecutionSummary:
             f"[red]{self.failed_count} 失败[/red]"
         )
 
+        # 一致性报告
+        if self.has_failures:
+            inconsistent = self.inconsistent_files
+            console.print(
+                f"\n[bold yellow]⚠  一致性报告：以下 {len(inconsistent)} 个文件"
+                f"可能处于不一致状态（操作失败）：[/bold yellow]"
+            )
+            for p in inconsistent:
+                console.print(f"  [red]• {p}[/red]")
+            console.print(
+                "[dim]建议：修复问题后重新运行 sync，或使用 --backup 保护已有文件。[/dim]"
+            )
+
 
 # ── 执行器 ────────────────────────────────────────────────────
 
@@ -99,13 +128,23 @@ class Executor:
     将 FileOperation 列表落地到文件系统。
 
     Args:
-        dry_run:   True 时只打印操作，不实际写磁盘。
-        fail_fast: True 时遇到第一个错误立即停止。
+        dry_run:     True 时只打印操作，不实际写磁盘。
+        fail_fast:   True 时遇到第一个错误立即停止。
+        backup:      True 时覆盖文件前先创建 .bak 备份。
+        state_db:    可选的 StateDB，用于文件级内容 hash 去重。
     """
 
-    def __init__(self, dry_run: bool = False, fail_fast: bool = False) -> None:
+    def __init__(
+        self,
+        dry_run: bool = False,
+        fail_fast: bool = False,
+        backup: bool = False,
+        state_db: Optional[StateDB] = None,
+    ) -> None:
         self.dry_run   = dry_run
         self.fail_fast = fail_fast
+        self.backup    = backup
+        self.state_db  = state_db
 
     def execute(self, ops: list[FileOperation]) -> ExecutionSummary:
         """
@@ -120,8 +159,38 @@ class Executor:
         summary = ExecutionSummary()
 
         for op in ops:
+            # 文件级内容 hash 去重（仅 create/replace 且有 state_db 时）
+            if (
+                self.state_db is not None
+                and op.content is not None
+                and op.op_type in (OpType.CREATE, OpType.REPLACE)
+            ):
+                h = _content_hash(op.content)
+                if not self.state_db.needs_file_sync(
+                    op.source_page_id, str(op.file_path), h
+                ):
+                    logger.debug("内容未变，跳过: %s", op.file_path)
+                    result = OperationResult(
+                        op, ResultStatus.SKIPPED, "内容未变，跳过"
+                    )
+                    summary.results.append(result)
+                    continue
+
             result = self._execute_one(op)
             summary.results.append(result)
+
+            # 成功后记录文件级状态
+            if (
+                self.state_db is not None
+                and result.status == ResultStatus.OK
+                and op.content is not None
+                and op.op_type in (OpType.CREATE, OpType.REPLACE)
+                and not self.dry_run
+            ):
+                h = _content_hash(op.content)
+                self.state_db.mark_file_synced(
+                    op.source_page_id, str(op.file_path), h
+                )
 
             if result.status == ResultStatus.FAILED and self.fail_fast:
                 console.print(
@@ -145,8 +214,16 @@ class Executor:
             return handler(op)
         except Exception as exc:  # noqa: BLE001
             msg = f"{type(exc).__name__}: {exc}"
+            logger.error("%s %s failed: %s", op.op_type.value, op.file_path, exc, exc_info=True)
             console.print(f"[red]❌ {op.op_type.value} {op.file_path}\n   {msg}[/red]")
             return OperationResult(op, ResultStatus.FAILED, msg, exc)
+
+    def _maybe_backup(self, file_path: Path) -> None:
+        """如果 backup=True 且文件存在，创建 .bak 备份。"""
+        if self.backup and file_path.exists():
+            bak = file_path.with_suffix(file_path.suffix + ".bak")
+            shutil.copy2(file_path, bak)
+            logger.debug("备份 %s → %s", file_path, bak)
 
     # ── 各操作实现 ────────────────────────────────────────────
 
@@ -166,6 +243,7 @@ class Executor:
     def _do_replace(self, op: FileOperation) -> OperationResult:
         exists = op.file_path.exists()
         if not self.dry_run:
+            self._maybe_backup(op.file_path)
             op.file_path.parent.mkdir(parents=True, exist_ok=True)
             op.file_path.write_text(op.content or "", encoding="utf-8")
 
@@ -180,6 +258,7 @@ class Executor:
             )
 
         if not self.dry_run:
+            self._maybe_backup(op.file_path)
             new_content = apply_patch(op.file_path, op.content or "")
             op.file_path.write_text(new_content, encoding="utf-8")
 

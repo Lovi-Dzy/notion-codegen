@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS pages (
 );
 """
 
+_CREATE_FILE_OPS_SQL = """
+CREATE TABLE IF NOT EXISTS file_ops (
+    page_id     TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    synced_at   TEXT NOT NULL,
+    PRIMARY KEY (page_id, file_path)
+);
+"""
+
 
 class StateDB:
     """
@@ -49,6 +59,7 @@ class StateDB:
         self._conn   = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_CREATE_TABLE_SQL)
+        self._conn.execute(_CREATE_FILE_OPS_SQL)
         self._conn.commit()
 
     # ── 核心 API ──────────────────────────────────────────────
@@ -118,9 +129,61 @@ class StateDB:
         ).fetchone()
         return dict(row) if row else None
 
+    # ── 文件级状态 ──────────────────────────────────────────────
+
+    def needs_file_sync(
+        self, page_id: str, file_path: str, content_hash: str
+    ) -> bool:
+        """
+        判断某个文件操作是否需要执行。
+
+        如果文件从未同步过，或者内容 hash 发生了变化，则返回 True。
+
+        Args:
+            page_id:      来源页面 ID。
+            file_path:    文件路径（字符串形式）。
+            content_hash: 当前内容的 sha256 hex。
+
+        Returns:
+            True → 需要执行；False → 内容未变，可跳过。
+        """
+        row = self._conn.execute(
+            "SELECT content_hash FROM file_ops WHERE page_id = ? AND file_path = ?",
+            (page_id, file_path),
+        ).fetchone()
+
+        if row is None:
+            return True
+        return content_hash != row["content_hash"]
+
+    def mark_file_synced(
+        self, page_id: str, file_path: str, content_hash: str
+    ) -> None:
+        """
+        记录某个文件已成功同步及其内容 hash。
+
+        Args:
+            page_id:      来源页面 ID。
+            file_path:    文件路径。
+            content_hash: 内容的 sha256 hex。
+        """
+        now_utc = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO file_ops (page_id, file_path, content_hash, synced_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(page_id, file_path) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                synced_at    = excluded.synced_at
+            """,
+            (page_id, file_path, content_hash, now_utc),
+        )
+        self._conn.commit()
+
     def clear(self) -> None:
         """清空所有同步状态（用于强制全量同步）。"""
         self._conn.execute("DELETE FROM pages")
+        self._conn.execute("DELETE FROM file_ops")
         self._conn.commit()
 
     def close(self) -> None:

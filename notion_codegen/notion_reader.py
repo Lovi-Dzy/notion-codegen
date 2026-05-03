@@ -13,6 +13,7 @@ Notion 页面读取模块。
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -20,7 +21,10 @@ from notion_client import Client
 from notion_client.errors import APIResponseError
 from rich.console import Console
 
+from .log import get_logger
+
 console = Console()
+logger = get_logger("notion_reader")
 
 
 # ── 数据结构 ─────────────────────────────────────────────────────
@@ -74,14 +78,16 @@ class NotionReader:
     # 子页面标题必须以该 emoji 开头才会被视为目录子页面
     SUBPAGE_PREFIX = "📁"
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, max_workers: int = 4) -> None:
         """
         Args:
-            token: Notion Integration Token（就是 .env 中的 NOTION_TOKEN）
+            token:       Notion Integration Token（就是 .env 中的 NOTION_TOKEN）
+            max_workers: 并发读取子页面的线程数（默认 4，对 Notion API 速率友好）。
         """
         if not token:
             raise ValueError("Notion token 不能为空，请检查 .env 中的 NOTION_TOKEN。")
         self.client = Client(auth=token)
+        self.max_workers = max_workers
 
     # ── 公共方法 ──────────────────────────────────────────
 
@@ -112,17 +118,25 @@ class NotionReader:
         # 递归读取子页面
         subpages: list[NotionPage] = []
         if recursive:
+            subpage_tasks: list[tuple[str, str]] = []  # (child_id, child_title)
             for block in blocks:
                 if self._is_dir_subpage(block):
                     child_id = block["id"].replace("-", "")
                     child_title = block["child_page"]["title"]
-                    console.print(
-                        f"  [dim]└─ 📁 {child_title}[/dim]"
-                    )
+                    subpage_tasks.append((child_id, child_title))
+
+            if len(subpage_tasks) >= 2:
+                # 并发读取多个子页面
+                subpages = self._read_subpages_parallel(subpage_tasks)
+            else:
+                # 只有 0-1 个子页面，串行即可
+                for child_id, child_title in subpage_tasks:
+                    console.print(f"  [dim]└─ 📁 {child_title}[/dim]")
                     try:
                         child = self.read_page(child_id, recursive=True)
                         subpages.append(child)
                     except APIResponseError as e:
+                        logger.warning("读取子页面失败 (%s): %s", child_title, e)
                         console.print(
                             f"  [yellow]⚠  读取子页面失败 ({child_title}): {e}[/yellow]"
                         )
@@ -134,6 +148,48 @@ class NotionReader:
             blocks=blocks,
             subpages=subpages,
         )
+
+    def _read_subpages_parallel(
+        self, tasks: list[tuple[str, str]]
+    ) -> list[NotionPage]:
+        """
+        并发读取多个子页面。
+
+        Args:
+            tasks: [(child_id, child_title), ...] 列表。
+
+        Returns:
+            成功读取的 NotionPage 列表（顺序与 tasks 一致）。
+        """
+        console.print(
+            f"  [dim]└─ 并发读取 {len(tasks)} 个子页面 (workers={self.max_workers})[/dim]"
+        )
+        results: dict[str, NotionPage | Exception] = {}
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            future_map = {
+                pool.submit(self.read_page, cid, True): (cid, ctitle)
+                for cid, ctitle in tasks
+            }
+            for future in as_completed(future_map):
+                cid, ctitle = future_map[future]
+                try:
+                    results[cid] = future.result()
+                    console.print(f"    [dim]✓ {ctitle}[/dim]")
+                except APIResponseError as e:
+                    logger.warning("读取子页面失败 (%s): %s", ctitle, e)
+                    console.print(
+                        f"    [yellow]⚠  {ctitle}: {e}[/yellow]"
+                    )
+                    results[cid] = e
+
+        # 按原始顺序收集成功的结果
+        subpages: list[NotionPage] = []
+        for cid, _ctitle in tasks:
+            r = results.get(cid)
+            if isinstance(r, NotionPage):
+                subpages.append(r)
+        return subpages
 
     def get_last_edited_map(self, page_id: str) -> dict[str, str]:
         """

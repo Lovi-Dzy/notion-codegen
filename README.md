@@ -5,6 +5,17 @@
 你在 Notion 中维护项目架构和代码模板，运行一条命令就能将它同步到本地文件系统。
 支持增量同步（只同步有变更的页面）和四种文件操作类型。
 
+## 项目结构概览
+
+本项目包含两个子系统：
+
+| 子系统 | 技术栈 | 说明 |
+|--------|--------|------|
+| **notion-codegen CLI** | Python (Click) | 核心同步工具，将 Notion 页面解析为本地文件 |
+| **Word Format Agent (WFA)** | TypeScript (Fastify + Next.js + BullMQ) | Web 管理平台，提供文档上传、AI 排版、DOCX 生成等功能 |
+
+CLI 是独立可用的工具；WFA Web 平台是配套的可视化管理界面（开发中）。
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -95,16 +106,22 @@
 ## 项目结构
 
     notion-codegen/
-    ├── notion_codegen/
-    │   ├── __init__.py        包声明与版本
-    │   ├── __main__.py        python -m notion_codegen 入口
-    │   ├── cli.py             CLI 命令定义
-    │   ├── config.py          .codegen.toml 配置加载
-    │   ├── notion_reader.py   Notion API 页面读取
-    │   ├── parser.py          块结构 → FileOperation 解析
-    │   ├── patcher.py         modify:patch 差异应用
-    │   ├── executor.py        文件操作执行
-    │   └── state.py           SQLite 增量状态追踪
+    ├── notion_codegen/            # Python CLI 核心
+    │   ├── __init__.py            包声明与版本
+    │   ├── __main__.py            python -m notion_codegen 入口
+    │   ├── cli.py                 CLI 命令定义
+    │   ├── config.py              .codegen.toml 配置加载
+    │   ├── log.py                 日志配置（rotating file handler）
+    │   ├── notion_reader.py       Notion API 页面读取（支持并发）
+    │   ├── parser.py              块结构 → FileOperation 解析
+    │   ├── patcher.py             modify:patch 差异应用
+    │   ├── executor.py            文件操作执行（支持 hash 去重 + 备份）
+    │   └── state.py               SQLite 增量状态追踪（页面级 + 文件级）
+    ├── apps/                      # WFA Web 平台（TypeScript）
+    │   ├── api/                   Fastify REST API
+    │   ├── worker/                BullMQ 后台任务处理
+    │   └── web/                   Next.js 前端
+    ├── packages/shared/           WFA 共享模块（类型、LLM 网关）
     ├── .codegen.toml
     ├── .env
     ├── .env.example

@@ -10,10 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import toml
-from dotenv import load_dotenv
-
-# 加载 .env 文件（若存在）
-load_dotenv()
 
 
 @dataclass
